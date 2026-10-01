@@ -1,0 +1,305 @@
+version: 2.1
+
+display:
+  home_url: https://github.com/Cobliteam/circleci-orb-uv
+  source_url: https://github.com/Cobliteam/circleci-orb-uv
+
+description: >
+  Installs uv, checked against the SHA-256 of its release archive, and installs
+  uv projects from their uv.lock. The orb carries the checksums of the uv
+  versions it vouches for and defaults to one of them; another version takes
+  its checksum as a parameter and must have been published at least 7 days
+  before.
+
+examples:
+  sync_project:
+    description: >
+      Install a uv project, locked, with its test group, and run the tests from
+      the project's virtual environment.
+    usage:
+      version: 2.1
+      orbs:
+        uv: cobli/uv@x.x.x
+      jobs:
+        test:
+          docker:
+            - image: cimg/python:3.11
+          steps:
+            - checkout
+            - uv/sync:
+                app-dir: ./airflow
+                args: --no-default-groups --group test
+            - run:
+                working_directory: ./airflow
+                command: .venv/bin/pytest
+      workflows:
+        main:
+          jobs:
+            - test
+
+  other_uv_version:
+    description: >
+      Use a uv version this orb does not carry. The checksum is the one in the
+      release's uv-<target>.tar.gz.sha256 for the job's platform, and the
+      install fails if the release is less than 7 days old.
+    usage:
+      version: 2.1
+      orbs:
+        uv: cobli/uv@x.x.x
+      jobs:
+        test:
+          docker:
+            - image: cimg/python:3.11
+          steps:
+            - checkout
+            - uv/sync:
+                version: 0.12.18
+                sha256: 89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
+      workflows:
+        main:
+          jobs:
+            - test
+
+  install_only:
+    description: >
+      Install uv and call it yourself, for example to export a lock for an
+      environment that installs with pip.
+    usage:
+      version: 2.1
+      orbs:
+        uv: cobli/uv@x.x.x
+      jobs:
+        export:
+          docker:
+            - image: cimg/python:3.11
+          steps:
+            - checkout
+            - uv/install
+            - run: uv export --frozen --no-emit-project -o requirements.txt
+      workflows:
+        main:
+          jobs:
+            - export
+
+commands:
+  install:
+    description: >
+      Installs uv into ~/.cobli-uv/bin, checked against the SHA-256 of its
+      release archive, and puts it first on the PATH of the following steps.
+      Fails if the uv the following steps would run is not that binary, at
+      that version: CI images can ship a uv of their own (cimg/python does).
+    parameters:
+      version:
+        description: >
+          uv version. The default is one this orb carries the checksums for;
+          another version needs sha256.
+        type: string
+        default: "0.10.2"
+      sha256:
+        description: >
+          SHA-256 of uv-<target>.tar.gz for the job's platform, from the
+          release's .sha256 file. Required for a version this orb does not
+          carry; for one it carries, it must match.
+        type: string
+        default: ""
+      min-release-age-days:
+        description: >
+          For a version this orb does not carry: refuse a release published
+          less than this many days ago, measured by the Last-Modified of its
+          archive. 0 skips the check.
+        type: integer
+        default: 7
+      python-downloads:
+        description: >
+          UV_PYTHON_DOWNLOADS for the following steps. The default, never, makes
+          uv use the job image's Python and fail if it does not satisfy the
+          project, instead of downloading one.
+        type: enum
+        enum: [never, manual, automatic]
+        default: never
+    steps:
+      - run:
+          name: Install uv << parameters.version >>
+          environment:
+            COBLI_UV_VERSION: << parameters.version >>
+            PARAM_SHA256: << parameters.sha256 >>
+            PARAM_MIN_AGE_DAYS: << parameters.min-release-age-days >>
+            PARAM_PYTHON_DOWNLOADS: << parameters.python-downloads >>
+          # POSIX sh, so it also runs on Alpine images without bash.
+          command: |
+            set -eu
+
+            case "$COBLI_UV_VERSION" in
+              ""|*[!0-9.]*) echo "cobli/uv: version must look like 0.10.2, got '$COBLI_UV_VERSION'" >&2; exit 1 ;;
+            esac
+
+            case "$(uname -m)" in
+              x86_64|amd64) arch=x86_64 ;;
+              aarch64|arm64) arch=aarch64 ;;
+              *) echo "cobli/uv: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+            esac
+            libc=gnu
+            if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then
+              libc=musl
+            fi
+            target="$arch-unknown-linux-$libc"
+            url="https://github.com/astral-sh/uv/releases/download/$COBLI_UV_VERSION/uv-$target.tar.gz"
+
+            # Versions this orb vouches for, with the SHA-256 that uv publishes
+            # for each archive. A version enters here only once its release is
+            # at least 7 days old. To add one, see the README.
+            case "$COBLI_UV_VERSION:$target" in
+              0.10.2:x86_64-unknown-linux-gnu) carried=6aa4576c31f791c0b9d4739e256d07358d45e7535695287fec03cf6839e25512 ;;
+              0.10.2:aarch64-unknown-linux-gnu) carried=4998f545234d52fc6f1280827d392f00a9278295050d59c53a776546dbf0124d ;;
+              0.10.2:x86_64-unknown-linux-musl) carried=c162182ba7dd692794362d76dd183990d6e51553217954106da19bdb6ced211b ;;
+              0.10.2:aarch64-unknown-linux-musl) carried=685e47f8f88b6845a9fc2ca27c3d246c0f53af8c017daf8e98ac0a97fe20365b ;;
+              *) carried= ;;
+            esac
+
+            if [ -n "$carried" ]; then
+              if [ -n "$PARAM_SHA256" ] && [ "$PARAM_SHA256" != "$carried" ]; then
+                echo "cobli/uv: sha256 does not match the checksum this orb carries for uv $COBLI_UV_VERSION ($target)" >&2
+                exit 1
+              fi
+              sha256=$carried
+            else
+              if [ -z "$PARAM_SHA256" ]; then
+                echo "cobli/uv: this orb does not carry uv $COBLI_UV_VERSION; pass sha256 with the checksum in $url.sha256" >&2
+                exit 1
+              fi
+              sha256=$PARAM_SHA256
+              if [ "$PARAM_MIN_AGE_DAYS" -gt 0 ]; then
+                if command -v curl >/dev/null 2>&1; then
+                  headers=$(curl -fsSIL --retry 3 "$url")
+                else
+                  headers=$(wget -S --spider -q "$url" 2>&1 || true)
+                fi
+                modified=$(printf '%s\n' "$headers" | tr -d '\r' | sed -n 's/^ *[Ll]ast-[Mm]odified: *//p' | tail -n 1)
+                published=$(date -u -d "$modified" +%s 2>/dev/null \
+                  || date -u -D '%a, %d %b %Y %H:%M:%S GMT' -d "$modified" +%s 2>/dev/null \
+                  || true)
+                if [ -z "$published" ]; then
+                  echo "cobli/uv: could not tell when uv $COBLI_UV_VERSION was published (Last-Modified: '$modified'); min-release-age-days: 0 skips this check" >&2
+                  exit 1
+                fi
+                age_days=$(( ($(date -u +%s) - published) / 86400 ))
+                if [ "$age_days" -lt "$PARAM_MIN_AGE_DAYS" ]; then
+                  echo "cobli/uv: uv $COBLI_UV_VERSION was published $age_days day(s) ago, less than min-release-age-days ($PARAM_MIN_AGE_DAYS)" >&2
+                  exit 1
+                fi
+              fi
+            fi
+
+            tmp=$(mktemp -d)
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL --retry 3 -o "$tmp/uv.tar.gz" "$url"
+            else
+              wget -q -O "$tmp/uv.tar.gz" "$url"
+            fi
+            echo "$sha256  $tmp/uv.tar.gz" | sha256sum -c -
+
+            dir="$HOME/.cobli-uv/bin"
+            mkdir -p "$dir"
+            tar -xzf "$tmp/uv.tar.gz" -C "$tmp"
+            cp "$tmp/uv-$target/uv" "$tmp/uv-$target/uvx" "$dir/"
+            rm -rf "$tmp"
+
+            # Following steps source $BASH_ENV (bash only; `sync` calls the
+            # binary by its full path, so it does not depend on this).
+            {
+              echo "export PATH=\"$dir:\$PATH\""
+              echo "export UV_PYTHON_DOWNLOADS=\"$PARAM_PYTHON_DOWNLOADS\""
+            } >> "$BASH_ENV"
+
+            PATH="$dir:$PATH"
+            found=$(command -v uv)
+            if [ "$found" != "$dir/uv" ]; then
+              echo "cobli/uv: the following steps would run $found, not $dir/uv" >&2
+              exit 1
+            fi
+            version=$("$dir/uv" --version)
+            case "$version" in
+              "uv $COBLI_UV_VERSION"|"uv $COBLI_UV_VERSION "*) ;;
+              *) echo "cobli/uv: $dir/uv answers '$version', expected $COBLI_UV_VERSION" >&2; exit 1 ;;
+            esac
+            echo "uv $COBLI_UV_VERSION for $target at $dir/uv"
+
+  sync:
+    description: >
+      Installs uv (the install command) and runs `uv sync --locked` in app-dir,
+      so the environment comes from uv.lock and uv checks every artifact against
+      the hash in it. --locked is not optional: it refuses a uv.lock that no
+      longer matches pyproject.toml, instead of resolving again. The uv cache is
+      saved keyed on uv.lock.
+    parameters:
+      app-dir:
+        description: Directory of the uv project (pyproject.toml and uv.lock).
+        type: string
+        default: "."
+      args:
+        description: >
+          More arguments for uv sync, after --locked. For example
+          `--no-default-groups --group test` or `--no-dev`.
+        type: string
+        default: ""
+      version:
+        description: Passed to the install command.
+        type: string
+        default: "0.10.2"
+      sha256:
+        description: Passed to the install command.
+        type: string
+        default: ""
+      min-release-age-days:
+        description: Passed to the install command.
+        type: integer
+        default: 7
+      python-downloads:
+        description: Passed to the install command.
+        type: enum
+        enum: [never, manual, automatic]
+        default: never
+      cache:
+        description: Restore and save the uv cache, keyed on uv.lock.
+        type: boolean
+        default: true
+      cache-prefix:
+        description: Change it to discard the saved caches.
+        type: string
+        default: cobli-uv-v1
+    steps:
+      - install:
+          version: << parameters.version >>
+          sha256: << parameters.sha256 >>
+          min-release-age-days: << parameters.min-release-age-days >>
+          python-downloads: << parameters.python-downloads >>
+      - when:
+          condition: << parameters.cache >>
+          steps:
+            - restore_cache:
+                keys:
+                  - << parameters.cache-prefix >>-{{ arch }}-{{ checksum "<< parameters.app-dir >>/uv.lock" }}
+                  - << parameters.cache-prefix >>-{{ arch }}-
+      - run:
+          name: uv sync --locked in << parameters.app-dir >>
+          working_directory: << parameters.app-dir >>
+          environment:
+            PARAM_ARGS: << parameters.args >>
+            PARAM_PYTHON_DOWNLOADS: << parameters.python-downloads >>
+          command: |
+            set -eu
+            export UV_CACHE_DIR="$HOME/.cache/uv"
+            export UV_PYTHON_DOWNLOADS="$PARAM_PYTHON_DOWNLOADS"
+            # PARAM_ARGS is split into separate arguments on purpose.
+            # shellcheck disable=SC2086
+            "$HOME/.cobli-uv/bin/uv" sync --locked $PARAM_ARGS
+      - when:
+          condition: << parameters.cache >>
+          steps:
+            - run:
+                name: Prune the uv cache for CI
+                command: UV_CACHE_DIR="$HOME/.cache/uv" "$HOME/.cobli-uv/bin/uv" cache prune --ci
+            - save_cache:
+                key: << parameters.cache-prefix >>-{{ arch }}-{{ checksum "<< parameters.app-dir >>/uv.lock" }}
+                paths:
+                  - ~/.cache/uv
