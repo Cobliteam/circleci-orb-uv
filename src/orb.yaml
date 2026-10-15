@@ -63,7 +63,9 @@ examples:
   install_only:
     description: >
       Install uv and call it yourself, for example to export a lock for an
-      environment that installs with pip.
+      environment that installs with pip. Export with --locked: it refuses a
+      uv.lock that no longer matches pyproject.toml, which --frozen exports
+      without a word.
     usage:
       version: 2.1
       orbs:
@@ -75,7 +77,7 @@ examples:
           steps:
             - checkout
             - uv/install
-            - run: uv export --frozen --no-emit-project -o requirements.txt
+            - run: uv export --locked --no-dev --no-emit-project -o requirements.txt
       workflows:
         main:
           jobs:
